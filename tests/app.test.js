@@ -19,7 +19,6 @@ describe('Student Express App Endpoints', () => {
     const res = await request(app).get('/api/info');
     expect(res.statusCode).toBe(200);
     expect(res.body.version).toBe('1.0.0');
+    expect(res.body.environment).toBeDefined();
   });
 });
-#test
-  
