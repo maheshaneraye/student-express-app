@@ -59,7 +59,8 @@ jobs:
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: "${{ secrets.DOCKERHUB_USERNAME || 'student' }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          format: 'table'
+          format: 'json'
+          output: 'trivy-report.json'
           exit-code: '0'
           ignore-unfixed: true
           vuln-type: 'os,library'
@@ -79,31 +80,120 @@ jobs:
       # Step 10: Trigger Centralized CI/CD Manager API (The Webhook Bridge)
       - name: Send Deployment Request to College Cloud CI/CD Manager
         if: github.event_name == 'push'
+        env:
+          COLLEGE_CD_URL: ${{ secrets.COLLEGE_CD_URL }}
+          COLLEGE_CD_TOKEN: ${{ secrets.COLLEGE_CD_TOKEN }}
+          COLLEGE_PROJECT_ID: ${{ vars.COLLEGE_PROJECT_ID }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME || 'student' }}/${{ env.IMAGE_NAME }}
         run: |
-          echo "Connecting to College Cloud Control Plane at ${{ secrets.COLLEGE_CD_URL }}..."
-          
-          COLLEGE_URL="${{ secrets.COLLEGE_CD_URL }}"
-          if [ -z "$COLLEGE_URL" ]; then
-            COLLEGE_URL="http://localhost:8000"
+          echo "Validating College Cloud CI/CD Manager configuration..."
+
+          if [ -z "$COLLEGE_CD_URL" ]; then
+            echo "::error::Missing required secret: COLLEGE_CD_URL"
+            exit 1
           fi
 
-          # Detect target environment based on branch
-          if [ "${{ github.ref_name }}" = "main" ]; then
+          if [ -z "$COLLEGE_CD_TOKEN" ]; then
+            echo "::error::Missing required secret: COLLEGE_CD_TOKEN"
+            exit 1
+          fi
+
+          if [ -z "$COLLEGE_PROJECT_ID" ]; then
+            echo "::error::Missing required repository variable: COLLEGE_PROJECT_ID"
+            exit 1
+          fi
+
+          # Detect target environment based on branch (main -> PRODUCTION, staging -> STAGING)
+          if [ "$BRANCH_NAME" = "main" ]; then
             TARGET_ENV="PRODUCTION"
           else
             TARGET_ENV="STAGING"
           fi
 
-          curl -X POST "$COLLEGE_URL/api/deployments/request" \
+          # Safe fallback for empty commit message
+          MSG="${COMMIT_MSG:-Automated commit via CI}"
+
+          # Extract vulnerability counts from machine-readable Trivy JSON report
+          echo "Extracting Trivy vulnerability scan results..."
+          if [ ! -f trivy-report.json ]; then
+            echo "::error::trivy-report.json not found! Security scan is missing or failed."
+            exit 1
+          fi
+
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select((.Severity // "") | ascii_upcase == "CRITICAL")] | length' trivy-report.json)
+          HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select((.Severity // "") | ascii_upcase == "HIGH")] | length' trivy-report.json)
+          MEDIUM_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select((.Severity // "") | ascii_upcase == "MEDIUM")] | length' trivy-report.json)
+          LOW_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select((.Severity // "") | ascii_upcase == "LOW")] | length' trivy-report.json)
+
+          if [ -z "$CRITICAL_COUNT" ] || [ -z "$HIGH_COUNT" ] || [ -z "$MEDIUM_COUNT" ] || [ -z "$LOW_COUNT" ]; then
+            echo "::error::Failed to extract vulnerability counts from trivy-report.json."
+            exit 1
+          fi
+
+          # Derive Trivy status based on scan results (Critical vulnerabilities block deployment)
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            TRIVY_STATUS="FAILED"
+          else
+            TRIVY_STATUS="PASSED"
+          fi
+
+          echo "Trivy Scan Results:"
+          echo "  Critical: $CRITICAL_COUNT"
+          echo "  High:     $HIGH_COUNT"
+          echo "  Medium:   $MEDIUM_COUNT"
+          echo "  Low:      $LOW_COUNT"
+          echo "  Status:   $TRIVY_STATUS"
+
+          # Construct JSON safely using jq to prevent injection or formatting breaks from quotes/newlines
+          PAYLOAD=$(jq -n \
+            --argjson projectId "$COLLEGE_PROJECT_ID" \
+            --arg commitSha "$COMMIT_SHA" \
+            --arg commitMessage "$MSG" \
+            --arg branch "$BRANCH_NAME" \
+            --arg environment "$TARGET_ENV" \
+            --arg image "$DOCKER_IMAGE" \
+            --arg imageTag "$COMMIT_SHA" \
+            --arg trivyStatus "$TRIVY_STATUS" \
+            --argjson critical "$CRITICAL_COUNT" \
+            --argjson high "$HIGH_COUNT" \
+            --argjson medium "$MEDIUM_COUNT" \
+            --argjson low "$LOW_COUNT" \
+            '{
+              projectId: $projectId,
+              commitSha: $commitSha,
+              commitMessage: $commitMessage,
+              branch: $branch,
+              environment: $environment,
+              image: $image,
+              imageTag: $imageTag,
+              trivyStatus: $trivyStatus,
+              trivySummary: {
+                critical: $critical,
+                high: $high,
+                medium: $medium,
+                low: $low
+              }
+            }')
+
+          echo "Dispatching deployment request to $COLLEGE_CD_URL/api/deployments/request..."
+
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$COLLEGE_CD_URL/api/deployments/request" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${{ secrets.COLLEGE_CD_TOKEN || 'demo_jwt_token_student_2026' }}" \
-            -d '{
-              "projectId": ${{ vars.COLLEGE_PROJECT_ID || 2 }},
-              "commitSha": "${{ github.sha }}",
-              "commitMessage": "${{ github.event.head_commit.message || 'Auto deployment via GitHub Actions' }}",
-              "branch": "${{ github.ref_name }}",
-              "environment": "'"$TARGET_ENV"'",
-              "image": "${{ secrets.DOCKERHUB_USERNAME || 'student' }}/${{ env.IMAGE_NAME }}",
-              "imageTag": "${{ github.sha }}",
-              "trivyStatus": "PASSED"
-            }'
+            -H "Authorization: Bearer $COLLEGE_CD_TOKEN" \
+            -d "$PAYLOAD")
+
+          HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+          HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n 1)
+
+          echo "Response HTTP Status: $HTTP_STATUS"
+          echo "Response Body: $HTTP_BODY"
+
+          if [ "$HTTP_STATUS" -ne 202 ] && [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "::error::Deployment request rejected by College Cloud CI/CD Manager (HTTP $HTTP_STATUS)"
+            exit 1
+          fi
+
+          echo "Deployment request successfully accepted by College Cloud CI/CD Manager!"
